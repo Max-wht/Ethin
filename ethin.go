@@ -31,6 +31,8 @@ var (
 
 	ErrInvalidPoolExpiry = errors.New("must provide an invalid expiry time")
 
+	ErrInvalidPoolIndex = errors.New("invalid pool size")
+
 	ErrInvalidPreAllocSize = errors.New("can not set up a negative capacity in preAlloc mode")
 
 	ErrPoolClosed = errors.New("this pool has been closed")
@@ -40,6 +42,8 @@ var (
 	ErrInvalidMultiPoolSize = errors.New("invalid size for multiple pool")
 
 	ErrInvalidLoadBalancingStrategy = errors.New("invalid load-balancing strategy")
+
+	ErrTimeout = errors.New("operation time out")
 
 	// 0 --> 单个调度器-->无缓冲通道
 	// 1 --> 多个调度器-->缓冲通道
@@ -282,10 +286,95 @@ func (p *poolCommon) Cap() int {
 	return int(atomic.LoadInt32(&p.capacity))
 }
 
+func (p *poolCommon) Free() int {
+	c := p.Cap()
+	if c < 0 {
+		return -1
+	}
+	return c - p.Running()
+}
+
 func (p *poolCommon) nowTime() time.Time {
 	return p.now.Load().(time.Time)
 }
 
 func (p *poolCommon) addWaiting(delta int) {
 	atomic.AddInt32(&p.waiting, int32(delta))
+}
+
+func (p *poolCommon) Tune(size int) {
+	capacity := p.Cap()
+	if capacity == -1 || size < 0 || capacity == size {
+		return
+	}
+	atomic.StoreInt32(&p.capacity, int32(size))
+	if size > capacity {
+		if size-capacity == 1 {
+			p.cond.Signal()
+			return
+		}
+		p.cond.Broadcast()
+	}
+}
+
+func (p *poolCommon) Release() {
+	if !atomic.CompareAndSwapInt32(&p.state, OPENED, CLOSED) {
+		return
+	}
+
+	if p.stopPurge != nil {
+		p.stopPurge()
+		p.stopPurge = nil
+	}
+
+	if p.stopTick2Ck != nil {
+		p.stopTick2Ck()
+		p.stopTick2Ck = nil
+	}
+
+	p.lock.Lock()
+	p.workers.reset()
+	p.lock.Unlock()
+
+	p.cond.Broadcast()
+}
+
+func (p *poolCommon) ReleaseTimeout(timeout time.Duration) error {
+	if p.IsClose() || (p.options.DisablePurge && p.stopPurge == nil) || p.stopTick2Ck == nil {
+		return ErrPoolClosed
+	}
+
+	p.Release()
+
+	var purgeCh <-chan struct{}
+	if !p.options.DisablePurge {
+		purgeCh = p.purgeCtx.Done()
+	} else {
+		purgeCh = p.allDone
+	}
+
+	if p.Running() == 0 {
+		p.once.Do(func() {
+			close(p.allDone)
+		})
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-timer.C:
+			return ErrTimeout
+		case <-p.allDone:
+			<-purgeCh
+			<-p.tick2Ctx.Done()
+			if p.Running() == 0 &&
+				(p.options.DisablePurge || atomic.LoadInt32(&p.purgeDone) == 1) &&
+				atomic.LoadInt32(&p.tick2Done) == 1 {
+				return nil
+			}
+		}
+
+	}
 }
