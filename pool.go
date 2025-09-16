@@ -1,5 +1,10 @@
 package ethin
 
+import (
+	"sync"
+	"sync/atomic"
+)
+
 type Pool struct {
 	*poolCommon
 }
@@ -34,4 +39,15 @@ func NewPool(size int, option ...Option) (*Pool, error) {
 	}
 
 	return pool, nil
+}
+
+func (p *poolCommon) Reboot() {
+	if atomic.CompareAndSwapInt32(&p.state, CLOSED, OPENED) {
+		atomic.StoreInt32(&p.purgeDone, 0)
+		p.goPurge()
+		atomic.StoreInt32(&p.tick2Done, 0)
+		p.goTick2Ck()
+		p.allDone = make(chan struct{})
+		p.once = &sync.Once{}
+	}
 }

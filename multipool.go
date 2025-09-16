@@ -174,3 +174,12 @@ func (mp *MultiPool) ReleaseTimeout(timeout time.Duration) error {
 
 	return errors.New(strings.TrimSuffix(errStr.String(), " | "))
 }
+
+func (mp *MultiPool) Reboot() {
+	if atomic.CompareAndSwapInt32(&mp.state, CLOSED, OPENED) {
+		atomic.StoreUint32(&mp.index, 0)
+		for _, pool := range mp.pools {
+			pool.Reboot()
+		}
+	}
+}
